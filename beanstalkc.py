@@ -3,6 +3,7 @@
 
 __license__ = '''
 Copyright (C) 2008-2011 Andreas Bolka
+Copyright (C) 2012 Urban Airship
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,65 +19,84 @@ limitations under the License.
 '''
 
 __version__ = '0.2.0'
-
-import logging
+import errno
+import select
 import socket
+
+import yaml
 
 
 DEFAULT_HOST = 'localhost'
 DEFAULT_PORT = 11300
 DEFAULT_PRIORITY = 2**31
 DEFAULT_TTR = 120
+DEFAULT_TIMEOUT = socket.getdefaulttimeout() or 2
+DEFAULT_SO_KEEPALIVE = False
 
 
-class BeanstalkcException(Exception): pass
-class UnexpectedResponse(BeanstalkcException): pass
-class CommandFailed(BeanstalkcException): pass
-class DeadlineSoon(BeanstalkcException): pass
-
-class SocketError(BeanstalkcException):
-    @staticmethod
-    def wrap(fn, *args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except socket.error, e:
-            raise SocketError(e)
+class Beanstalkc2Exception(Exception): pass
+class ConnectionClosed(Beanstalkc2Exception):
+    """beanstalkd server connection unexpectedly closed"""
+class CommandFailed(Beanstalkc2Exception): pass
+class UnexpectedResponse(Beanstalkc2Exception): pass
+class DeadlineSoon(Exception): pass
 
 
 class Connection(object):
-    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT, parse_yaml=True,
-                 connect_timeout=socket.getdefaulttimeout()):
-        if parse_yaml is True:
-            try:
-                parse_yaml = __import__('yaml').load
-            except ImportError:
-                logging.error('Failed to load PyYAML, will not parse YAML')
-                parse_yaml = False
-        self._connect_timeout= connect_timeout
-        self._parse_yaml = parse_yaml or (lambda x: x)
+    def __init__(self, host=DEFAULT_HOST, port=DEFAULT_PORT,
+                 timeout=DEFAULT_TIMEOUT, keepalives=DEFAULT_SO_KEEPALIVE):
         self.host = host
         self.port = port
+        self.timeout = timeout
+        self.keepalives = keepalives
+        self.buf = bytearray()
         self.connect()
 
     def connect(self):
         """Connect to beanstalkd server."""
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.settimeout(self._connect_timeout)
-        SocketError.wrap(self._socket.connect, (self.host, self.port))
-        self._socket.settimeout(None)
-        self._socket_file = self._socket.makefile('rb')
+        self._socket = socket.create_connection(
+                (self.host, self.port), self.timeout)
+        self._socket.setblocking(0)
+        if self.keepalives:
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self._select_socket = [self._socket.fileno()]
 
     def close(self):
         """Close connection to server."""
         try:
-            self._socket.sendall('quit\r\n')
+            self._sendall('quit\r\n')
             self._socket.close()
         except socket.error:
             pass
 
-    def _interact(self, command, expected_ok, expected_err=[]):
-        SocketError.wrap(self._socket.sendall, command)
-        status, results = self._read_response()
+    def _sendall(self, data):
+        try:
+            sent = self._socket.send(data)
+        except socket.error as e:
+            if e.errno == errno.EAGAIN:
+                # EAGAIN means we just need to select and try again
+                sent = 0
+            else:
+                raise
+        remaining = len(data) - sent
+        while remaining:
+            _, w, _ = select.select([], self._select_socket, [], self.timeout)
+            if not w:
+                raise socket.timeout('timed out')
+            try:
+                sent += self._socket.send(data[sent:])
+            except socket.error as e:
+                # EAGAINs are safe to ignore
+                if e.errno != errno.EAGAIN:
+                    raise
+            else:
+                remaining -= sent
+
+    def _interact(self, command, expected_ok, expected_err=(), timeout=None):
+        if timeout is None:
+            timeout = self.timeout
+        self._sendall(command)
+        status, results = self._read_response(timeout)
         if status in expected_ok:
             return results
         elif status in expected_err:
@@ -84,32 +104,53 @@ class Connection(object):
         else:
             raise UnexpectedResponse(command.split()[0], status, results)
 
-    def _read_response(self):
-        line = SocketError.wrap(self._socket_file.readline)
-        if not line:
-            raise SocketError()
-        response = line.split()
-        return response[0], response[1:]
+    def _read_response(self, timeout):
+        while 1:
+            r, _, _ = select.select(self._select_socket, [], [], timeout)
+            if not r:
+                raise socket.timeout('timed out')
+            chunk = self._socket.recv(256)
+            if not chunk:
+                raise ConnectionClosed(
+                        '%s:%s connection closed' % (self.host, self.port))
+            self.buf.extend(chunk)
+            line, _, self.buf = self.buf.partition('\r\n')
+            if line:
+                # Line received, return
+                response = line.split()
+                return response[0], response[1:]
 
     def _read_body(self, size):
-        body = SocketError.wrap(self._socket_file.read, size)
-        SocketError.wrap(self._socket_file.read, 2) # trailing crlf
-        if size > 0 and not body:
-            raise SocketError()
+        full_size = size + 2  # trailing "\r\n"
+        remaining = full_size - len(self.buf)
+        while remaining > 0:
+            r, _, _ = select.select(self._select_socket, [], [], self.timeout)
+            if not r:
+                raise socket.timeout('timed out')
+            chunk = self._socket.recv(remaining)
+            if not chunk:
+                raise ConnectionClosed(
+                        '%s:%s connection closed' % (self.host, self.port))
+            self.buf.extend(chunk)
+            remaining = full_size - len(self.buf)
+        body = str(self.buf[:size])
+        self.buf = self.buf[full_size:]
         return body
 
-    def _interact_value(self, command, expected_ok, expected_err=[]):
+    def _interact_value(self, command, expected_ok, expected_err=()):
         return self._interact(command, expected_ok, expected_err)[0]
 
-    def _interact_job(self, command, expected_ok, expected_err, reserved=True):
-        jid, size = self._interact(command, expected_ok, expected_err)
+    def _interact_job(self, command, expected_ok, expected_err, reserved=True,
+                      timeout=None):
+        jid, size = self._interact(
+                command, expected_ok, expected_err, timeout=timeout)
         body = self._read_body(int(size))
         return Job(self, int(jid), body, reserved)
 
-    def _interact_yaml(self, command, expected_ok, expected_err=[]):
+    def _interact_yaml(self, command, expected_ok, expected_err=()):
         size, = self._interact(command, expected_ok, expected_err)
         body = self._read_body(int(size))
-        return self._parse_yaml(body)
+        return yaml.load(body)
 
     def _interact_peek(self, command):
         try:
@@ -133,12 +174,15 @@ class Connection(object):
         in seconds. Returns a Job object, or None if the request times out."""
         if timeout is not None:
             command = 'reserve-with-timeout %d\r\n' % timeout
+            socket_timeout = timeout + self.timeout
         else:
             command = 'reserve\r\n'
+            socket_timeout = timeout
         try:
             return self._interact_job(command,
                                       ['RESERVED'],
-                                      ['DEADLINE_SOON', 'TIMED_OUT'])
+                                      ['DEADLINE_SOON', 'TIMED_OUT'],
+                                      timeout=socket_timeout)
         except CommandFailed, (_, status, results):
             if status == 'TIMED_OUT':
                 return None
@@ -206,7 +250,7 @@ class Connection(object):
 
     def pause_tube(self, name, delay):
         """Pause a tube for a given delay time, in seconds."""
-        self._interact('pause-tube %s %d\r\n' %(name, delay),
+        self._interact('pause-tube %s %d\r\n' % (name, delay),
                        ['PAUSED'],
                        ['NOT_FOUND'])
 
